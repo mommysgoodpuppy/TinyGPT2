@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#region import
+# region import
 import os, math, time
 import numpy as np
 from tinygrad import Tensor, nn, fetch, Device, TinyJit, GlobalCounters
@@ -9,15 +9,16 @@ from typing import List, Literal
 from tinygrad.helpers import dedup, flatten, getenv
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes, least_upper_dtype
+from tinygrad.nn.state import get_state_dict, safe_load, safe_save
 os.environ["GPU"] = "1"
-#endregion
+# endregion
 
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
-    padded_vocab_size: int = 50304
+    padded_vocab_size: int = 50257
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -72,6 +73,86 @@ class Optimizer:
 
     def _step(self) -> List[Tensor]:
         raise NotImplementedError
+
+# region adamw optimizer
+def AdamW(
+    params: List[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01
+):
+    """
+    AdamW optimizer with optional weight decay.
+
+    - Described: https://paperswithcode.com/method/adamw
+    - Paper: https://arxiv.org/abs/1711.05101v3
+    """
+    return LAMB(params, lr, b1, b2, eps, weight_decay, adam=True)
+
+class LAMB(Optimizer):
+    """
+    LAMB optimizer with optional weight decay.
+
+    - Described: https://paperswithcode.com/method/lamb
+    - Paper: https://arxiv.org/abs/1904.00962
+    """
+
+    def __init__(
+        self,
+        params: List[Tensor],
+        lr=0.001,
+        b1=0.9,
+        b2=0.999,
+        eps=1e-6,
+        weight_decay=0.0,
+        adam=False,
+    ):
+        super().__init__(params, lr)
+        self.b1, self.b2, self.eps, self.wd, self.adam = (
+            b1,
+            b2,
+            eps,
+            weight_decay,
+            adam,
+        )
+        self.b1_t, self.b2_t = (
+            Tensor.ones(
+                (1,), dtype=dtypes.float32, device=self.device, requires_grad=False
+            ).contiguous()
+            for _ in [b1, b2]
+        )
+        self.m = [
+            Tensor.zeros(
+                *t.shape, dtype=dtypes.float32, device=t.device, requires_grad=False
+            ).contiguous()
+            for t in self.params
+        ]
+        self.v = [
+            Tensor.zeros(
+                *t.shape, dtype=dtypes.float32, device=t.device, requires_grad=False
+            ).contiguous()
+            for t in self.params
+        ]
+
+    def _step(self) -> List[Tensor]:
+        self.b1_t *= self.b1
+        self.b2_t *= self.b2
+        for i, t in enumerate(self.params):
+            assert t.grad is not None
+            self.m[i].assign(self.b1 * self.m[i] + (1.0 - self.b1) * t.grad)
+            self.v[i].assign(
+                self.b2 * self.v[i] + (1.0 - self.b2) * (t.grad * t.grad)
+            )
+            m_hat = self.m[i] / (1.0 - self.b1_t)
+            v_hat = self.v[i] / (1.0 - self.b2_t)
+            up = (m_hat / (v_hat.sqrt() + self.eps)) + self.wd * t.detach()
+            if not self.adam:
+                r1 = t.detach().square().sum().sqrt()
+                r2 = up.square().sum().sqrt()
+                r = Tensor.where(r1 > 0, Tensor.where(r2 > 0, r1 / r2, 1.0), 1.0)
+            else:
+                r = 1.0
+            t.assign((t.detach() - self.lr * r * up).cast(t.dtype))
+        return [self.b1_t, self.b2_t] + self.m + self.v
+
+# endregion
 
 class CausalSelfAttention:
     def __init__(self, config: GPTConfig):
@@ -185,6 +266,10 @@ class GPT:
             idx_next = logits.softmax().multinomial()
             idx = Tensor.cat(idx, idx_next, dim=1)
         return idx
+    def save_model(self, filename):
+        """Save just the model weights"""
+        state_dict = get_state_dict(self)
+        safe_save(state_dict, filename)
 
     def __call__(self, idx: Tensor, targets=None):
         b, t = idx.shape
@@ -240,6 +325,12 @@ def sparse_categorical_crossentropy(
     )
 
 
+def load_model(self, filename):
+    """Load just the model weights"""
+    weights = safe_load(filename)
+    nn.state.load_state_dict(self, weights)
+
+
 if __name__ == "__main__":
     import tiktoken, argparse
 
@@ -265,8 +356,6 @@ if __name__ == "__main__":
     decode = lambda l: enc.decode(l)
 
     # load the tokens
-    # prefer to use tiny_shakespeare if it's available, otherwise use tiny_stories
-    # we're using val instead of train split just because it is smaller/faster
     tokens_bin = fetch(
         "https://huggingface.co/datasets/karpathy/llmc-starter-pack/resolve/main/tiny_shakespeare_val.bin"
     )
@@ -280,7 +369,6 @@ if __name__ == "__main__":
     # lightweight dataloader
     def get_batch():
         assert B * T + 1 <= len(tokens), "not enough tokens"
-        # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
         i = 0
         while True:
             x = tokens[i : i + B * T].view(B, T)
@@ -288,89 +376,8 @@ if __name__ == "__main__":
             yield x, y
             i += B * T
             if i + B * T + 1 >= len(tokens):
-                i = 0  # in prod we'd want to randomize the start point a bit
+                i = 0
 
-    # region adamw optimizer
-    def AdamW(
-        params: List[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01
-    ):
-        """
-        AdamW optimizer with optional weight decay.
-
-        - Described: https://paperswithcode.com/method/adamw
-        - Paper: https://arxiv.org/abs/1711.05101v3
-        """
-        return LAMB(params, lr, b1, b2, eps, weight_decay, adam=True)
-
-    class LAMB(Optimizer):
-        """
-        LAMB optimizer with optional weight decay.
-
-        - Described: https://paperswithcode.com/method/lamb
-        - Paper: https://arxiv.org/abs/1904.00962
-        """
-
-        def __init__(
-            self,
-            params: List[Tensor],
-            lr=0.001,
-            b1=0.9,
-            b2=0.999,
-            eps=1e-6,
-            weight_decay=0.0,
-            adam=False,
-        ):
-            super().__init__(params, lr)
-            self.b1, self.b2, self.eps, self.wd, self.adam = (
-                b1,
-                b2,
-                eps,
-                weight_decay,
-                adam,
-            )
-            self.b1_t, self.b2_t = (
-                Tensor.ones(
-                    (1,), dtype=dtypes.float32, device=self.device, requires_grad=False
-                ).contiguous()
-                for _ in [b1, b2]
-            )
-            self.m = [
-                Tensor.zeros(
-                    *t.shape, dtype=dtypes.float32, device=t.device, requires_grad=False
-                ).contiguous()
-                for t in self.params
-            ]
-            self.v = [
-                Tensor.zeros(
-                    *t.shape, dtype=dtypes.float32, device=t.device, requires_grad=False
-                ).contiguous()
-                for t in self.params
-            ]
-
-        def _step(self) -> List[Tensor]:
-            self.b1_t *= self.b1
-            self.b2_t *= self.b2
-            for i, t in enumerate(self.params):
-                assert t.grad is not None
-                self.m[i].assign(self.b1 * self.m[i] + (1.0 - self.b1) * t.grad)
-                self.v[i].assign(
-                    self.b2 * self.v[i] + (1.0 - self.b2) * (t.grad * t.grad)
-                )
-                m_hat = self.m[i] / (1.0 - self.b1_t)
-                v_hat = self.v[i] / (1.0 - self.b2_t)
-                up = (m_hat / (v_hat.sqrt() + self.eps)) + self.wd * t.detach()
-                if not self.adam:
-                    r1 = t.detach().square().sum().sqrt()
-                    r2 = up.square().sum().sqrt()
-                    r = Tensor.where(r1 > 0, Tensor.where(r2 > 0, r1 / r2, 1.0), 1.0)
-                else:
-                    r = 1.0
-                t.assign((t.detach() - self.lr * r * up).cast(t.dtype))
-            return [self.b1_t, self.b2_t] + self.m + self.v
-
-    # endregion
-
-    # forward backward for a few iterations
     data_iter = iter(get_batch())
     x, y = next(data_iter)  # we'll overfit this batch below
     optimizer = AdamW(nn.state.get_parameters(model), lr=1e-4, weight_decay=0)
@@ -382,6 +389,10 @@ if __name__ == "__main__":
         loss.backward()
         return loss.realize(*optimizer.schedule_step())
 
+    # Create checkpoints directory if it doesn't exist
+    if not os.path.exists("checkpoints"):
+        os.makedirs("checkpoints")
+
     with Tensor.train():
         for i in range(args.num_iterations):
             GlobalCounters.reset()
@@ -392,6 +403,16 @@ if __name__ == "__main__":
             print(
                 f"iteration {i}, loss: {loss.item():.6f}, time: {(t1-t0)*1000:.3f}ms, {int(B*T/(t1-t0))} tok/s"
             )
+
+            # Save checkpoint every 10 iterations
+            if i > 0 and i % 10 == 0:
+                checkpoint_path = f"checkpoints/gpt2_iter_{i}.safetensors"
+                model.save_model(checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+        # Save final model
+        model.save_model("checkpoints/gpt2_final.safetensors")
+        print("Saved final model")
 
     if not args.skip_test:
         start = "<|endoftext|>"
